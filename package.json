@@ -1,0 +1,13 @@
+{
+  "name": "astrogame-proxy",
+  "version": "1.0.0",
+  "description": "Proxy server for astrogame backend",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "build": "echo 'No build needed'"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
