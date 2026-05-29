@@ -99,7 +99,8 @@ async function upsertLeaderboardEntry(data) {
 }
 
 async function getTopLeaderboard(limit) {
-  return await dbQuery('SELECT * FROM leaderboard ORDER BY totalScore DESC LIMIT ?', [limit]);
+  const safeLimit = Math.max(1, Math.min(parseInt(limit, 10) || 100, 500));
+  return await dbQuery(`SELECT * FROM leaderboard ORDER BY totalScore DESC LIMIT ${safeLimit}`, []);
 }
 
 async function getUserRank(userId) {
@@ -127,7 +128,8 @@ async function upsertWeeklyScore(data) {
 
 async function getWeeklyLeaderboard(limit) {
   const weekStart = getCurrentWeekStart();
-  return await dbQuery('SELECT * FROM weeklyScores WHERE weekStart=? ORDER BY weeklyPoints DESC LIMIT ?', [weekStart, limit]);
+  const safeLimit = Math.max(1, Math.min(parseInt(limit, 10) || 100, 500));
+  return await dbQuery(`SELECT * FROM weeklyScores WHERE weekStart=? ORDER BY weeklyPoints DESC LIMIT ${safeLimit}`, [weekStart]);
 }
 
 async function getMyWeeklyRank(userId) {
