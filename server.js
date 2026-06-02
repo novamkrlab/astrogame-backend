@@ -46,6 +46,13 @@ async function dbQuery(sql, params = []) {
   return rows;
 }
 
+function generateFriendCode() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let code = '';
+  for (let i = 0; i < 6; i++) code += chars[Math.floor(Math.random() * chars.length)];
+  return code;
+}
+
 function getCurrentWeekStart() {
   const now = new Date();
   const day = now.getDay();
@@ -258,6 +265,55 @@ async function handleRequest(req, res) {
         gamesPlayed: Number(gamesPlayed) || 0,
         level: Number(level) || 1,
       });
+      result = { success: true };
+    }
+    else if (procedure === 'friends.getMyCode') {
+      const { deviceId } = input;
+      if (!deviceId) throw new Error('deviceId required');
+      const user = await upsertDeviceUser(deviceId, 'Kaşif');
+      let rows = await dbQuery('SELECT code FROM friendCodes WHERE userId=? LIMIT 1', [user.id]);
+      if (rows.length === 0) {
+        const code = generateFriendCode();
+        await dbQuery('INSERT INTO friendCodes (userId, code) VALUES (?,?) ON DUPLICATE KEY UPDATE code=code', [user.id, code]);
+        rows = await dbQuery('SELECT code FROM friendCodes WHERE userId=? LIMIT 1', [user.id]);
+      }
+      result = { friendCode: rows[0].code };
+    }
+    else if (procedure === 'friends.addByCode') {
+      const { deviceId, friendCode } = input;
+      if (!deviceId || !friendCode) throw new Error('deviceId and friendCode required');
+      const user = await upsertDeviceUser(deviceId, 'Kaşif');
+      const codeRows = await dbQuery('SELECT userId FROM friendCodes WHERE code=? LIMIT 1', [friendCode.toUpperCase()]);
+      if (codeRows.length === 0) throw new Error('Geçersiz arkadaş kodu. Lütfen tekrar kontrol edin.');
+      const friendUserId = codeRows[0].userId;
+      if (friendUserId === user.id) throw new Error('Kendi kodunu ekleyemezsin!');
+      const existing = await dbQuery('SELECT id FROM friends WHERE userId=? AND friendUserId=? LIMIT 1', [user.id, friendUserId]);
+      if (existing.length > 0) throw new Error('Bu kişi zaten arkadaş listenizde.');
+      await dbQuery('INSERT INTO friends (userId, friendUserId) VALUES (?,?)', [user.id, friendUserId]);
+      await dbQuery('INSERT INTO friends (userId, friendUserId) VALUES (?,?) ON DUPLICATE KEY UPDATE id=id', [friendUserId, user.id]);
+      const nameRows = await dbQuery('SELECT displayName FROM leaderboard WHERE userId=? LIMIT 1', [friendUserId]);
+      const friendName = nameRows[0]?.displayName ?? 'Kaşif';
+      result = { success: true, friendName };
+    }
+    else if (procedure === 'friends.getList') {
+      const { deviceId } = input;
+      if (!deviceId) throw new Error('deviceId required');
+      const user = await upsertDeviceUser(deviceId, 'Kaşif');
+      const friendRows = await dbQuery('SELECT friendUserId FROM friends WHERE userId=?', [user.id]);
+      if (friendRows.length === 0) { result = []; }
+      else {
+        const ids = friendRows.map(r => r.friendUserId);
+        const placeholders = ids.map(() => '?').join(',');
+        const entries = await dbQuery(`SELECT l.userId, l.displayName, l.avatar, l.totalScore, l.level, l.sciencePoints FROM leaderboard l WHERE l.userId IN (${placeholders}) ORDER BY l.totalScore DESC`, ids);
+        result = entries;
+      }
+    }
+    else if (procedure === 'friends.removeFriend') {
+      const { deviceId, friendUserId } = input;
+      if (!deviceId || !friendUserId) throw new Error('deviceId and friendUserId required');
+      const user = await upsertDeviceUser(deviceId, 'Kaşif');
+      await dbQuery('DELETE FROM friends WHERE userId=? AND friendUserId=?', [user.id, Number(friendUserId)]);
+      await dbQuery('DELETE FROM friends WHERE userId=? AND friendUserId=?', [Number(friendUserId), user.id]);
       result = { success: true };
     }
     else {
