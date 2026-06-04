@@ -6,6 +6,7 @@
  */
 
 const http = require('http');
+const https = require('https');
 const mysql = require('mysql2/promise');
 
 const PORT = process.env.PORT || 10000;
@@ -68,7 +69,7 @@ function getPreviousWeekStart() {
   const day = now.getDay();
   const diff = day === 0 ? -6 : 1 - day;
   const monday = new Date(now);
-  monday.setDate(now.getDate() + diff - 7); // bir önceki Pazartesi
+  monday.setDate(now.getDate() + diff - 7);
   monday.setHours(0, 0, 0, 0);
   return monday.toISOString().slice(0, 10);
 }
@@ -158,6 +159,92 @@ async function getMyWeeklyRank(userId) {
   return Number(rows[0]?.cnt || 0) + 1;
 }
 
+// ─── Push Notification Helpers ────────────────────────────────────────────────
+
+async function ensurePushTokensTable() {
+  await dbQuery(`
+    CREATE TABLE IF NOT EXISTS pushTokens (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      userId INT NOT NULL,
+      pushToken VARCHAR(200) NOT NULL,
+      updatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      UNIQUE KEY unique_user (userId),
+      KEY idx_token (pushToken(100))
+    )
+  `);
+}
+
+async function savePushToken(userId, pushToken) {
+  await ensurePushTokensTable();
+  await dbQuery(
+    'INSERT INTO pushTokens (userId, pushToken) VALUES (?,?) ON DUPLICATE KEY UPDATE pushToken=?, updatedAt=NOW()',
+    [userId, pushToken, pushToken]
+  );
+}
+
+async function getAllPushTokens() {
+  try {
+    await ensurePushTokensTable();
+    const rows = await dbQuery('SELECT pushToken FROM pushTokens', []);
+    return rows.map(r => r.pushToken).filter(t => t && t.startsWith('ExponentPushToken'));
+  } catch {
+    return [];
+  }
+}
+
+// Expo Push API ile bildirim gönder
+async function sendExpoPushNotifications(tokens, title, body, data = {}) {
+  if (!tokens || tokens.length === 0) {
+    console.log('[Push] No tokens to send to');
+    return;
+  }
+
+  // 100'lü gruplar halinde gönder (Expo limiti)
+  const chunks = [];
+  for (let i = 0; i < tokens.length; i += 100) {
+    chunks.push(tokens.slice(i, i + 100));
+  }
+
+  for (const chunk of chunks) {
+    const messages = chunk.map(token => ({
+      to: token,
+      title,
+      body,
+      data,
+      sound: 'default',
+      priority: 'high',
+    }));
+
+    const payload = JSON.stringify(messages);
+    await new Promise((resolve, reject) => {
+      const req = https.request({
+        hostname: 'exp.host',
+        path: '/--/api/v2/push/send',
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+          'Accept-Encoding': 'gzip, deflate',
+          'Content-Length': Buffer.byteLength(payload),
+        },
+      }, (res) => {
+        let responseData = '';
+        res.on('data', chunk => { responseData += chunk; });
+        res.on('end', () => {
+          console.log(`[Push] Sent ${chunk.length} notifications, status: ${res.statusCode}`);
+          resolve(responseData);
+        });
+      });
+      req.on('error', (err) => {
+        console.error('[Push] Request error:', err.message);
+        resolve(null); // hata olsa da devam et
+      });
+      req.write(payload);
+      req.end();
+    });
+  }
+}
+
 // ─── Haftalık Sıfırlama ───────────────────────────────────────────────────────
 
 async function ensureWeeklyWinnersTable() {
@@ -199,6 +286,18 @@ async function performWeeklyReset() {
           [prevWeekStart, w.userId, w.displayName, w.avatar, w.weeklyPoints]
         );
         console.log(`[WeeklyReset] Winner saved: ${w.displayName} (${w.weeklyPoints} pts) for week ${prevWeekStart}`);
+
+        // Tüm kullanıcılara bildirim gönder
+        const allTokens = await getAllPushTokens();
+        if (allTokens.length > 0) {
+          await sendExpoPushNotifications(
+            allTokens,
+            '🏅 Haftanın Kazananı!',
+            `${w.avatar} ${w.displayName} bu haftayı ${w.weeklyPoints} puanla kazandı! Sen de bu hafta rekabete katıl!`,
+            { screen: 'leaderboard', tab: 'history' }
+          );
+          console.log(`[WeeklyReset] Winner notification sent to ${allTokens.length} users`);
+        }
       } else {
         console.log(`[WeeklyReset] No scores found for week ${prevWeekStart}, skipping winner save.`);
       }
@@ -359,6 +458,21 @@ async function handleRequest(req, res) {
       });
       result = { success: true };
     }
+    else if (procedure === 'leaderboard.getWeeklyWinners') {
+      await ensureWeeklyWinnersTable();
+      const winners = await dbQuery(
+        'SELECT * FROM weeklyWinners ORDER BY weekStart DESC LIMIT 8'
+      );
+      result = winners;
+    }
+    else if (procedure === 'notifications.registerToken') {
+      const { deviceId, pushToken } = input;
+      if (!deviceId || !pushToken) throw new Error('deviceId and pushToken required');
+      if (!pushToken.startsWith('ExponentPushToken')) throw new Error('Invalid push token format');
+      const user = await upsertDeviceUser(deviceId, 'Kaşif');
+      await savePushToken(user.id, pushToken);
+      result = { success: true };
+    }
     else if (procedure === 'friends.getMyCode') {
       const { deviceId } = input;
       if (!deviceId) throw new Error('deviceId required');
@@ -407,14 +521,6 @@ async function handleRequest(req, res) {
       await dbQuery('DELETE FROM friends WHERE userId=? AND friendUserId=?', [user.id, Number(friendUserId)]);
       await dbQuery('DELETE FROM friends WHERE userId=? AND friendUserId=?', [Number(friendUserId), user.id]);
       result = { success: true };
-    }
-    else if (procedure === 'leaderboard.getWeeklyWinners') {
-      // Son 8 haftanın kazananlarını getir
-      await ensureWeeklyWinnersTable();
-      const winners = await dbQuery(
-        'SELECT * FROM weeklyWinners ORDER BY weekStart DESC LIMIT 8'
-      );
-      result = winners;
     }
     else {
       res.writeHead(404);
