@@ -63,6 +63,16 @@ function getCurrentWeekStart() {
   return monday.toISOString().slice(0, 10);
 }
 
+function getPreviousWeekStart() {
+  const now = new Date();
+  const day = now.getDay();
+  const diff = day === 0 ? -6 : 1 - day;
+  const monday = new Date(now);
+  monday.setDate(now.getDate() + diff - 7); // bir önceki Pazartesi
+  monday.setHours(0, 0, 0, 0);
+  return monday.toISOString().slice(0, 10);
+}
+
 async function getUserByOpenId(openId) {
   const rows = await dbQuery('SELECT * FROM users WHERE openId = ? LIMIT 1', [openId]);
   return rows[0] || null;
@@ -146,6 +156,88 @@ async function getMyWeeklyRank(userId) {
   const myPoints = myRows[0].weeklyPoints;
   const rows = await dbQuery('SELECT COUNT(*) as cnt FROM weeklyScores WHERE weekStart=? AND weeklyPoints > ?', [weekStart, myPoints]);
   return Number(rows[0]?.cnt || 0) + 1;
+}
+
+// ─── Haftalık Sıfırlama ───────────────────────────────────────────────────────
+
+async function ensureWeeklyWinnersTable() {
+  await dbQuery(`
+    CREATE TABLE IF NOT EXISTS weeklyWinners (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      weekStart VARCHAR(10) NOT NULL,
+      userId INT NOT NULL,
+      displayName VARCHAR(100) NOT NULL,
+      avatar VARCHAR(10) DEFAULT '🧑‍🔬',
+      weeklyPoints INT DEFAULT 0,
+      createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE KEY unique_week (weekStart)
+    )
+  `);
+}
+
+async function performWeeklyReset() {
+  const prevWeekStart = getPreviousWeekStart();
+  const currentWeekStart = getCurrentWeekStart();
+
+  console.log(`[WeeklyReset] Checking reset — prevWeek: ${prevWeekStart}, currentWeek: ${currentWeekStart}`);
+
+  try {
+    await ensureWeeklyWinnersTable();
+
+    // Geçen haftanın kazananını kontrol et
+    const alreadySaved = await dbQuery('SELECT id FROM weeklyWinners WHERE weekStart=? LIMIT 1', [prevWeekStart]);
+    if (alreadySaved.length === 0) {
+      // Geçen haftanın birincisini bul
+      const winners = await dbQuery(
+        'SELECT userId, displayName, avatar, weeklyPoints FROM weeklyScores WHERE weekStart=? ORDER BY weeklyPoints DESC LIMIT 1',
+        [prevWeekStart]
+      );
+      if (winners.length > 0) {
+        const w = winners[0];
+        await dbQuery(
+          'INSERT INTO weeklyWinners (weekStart, userId, displayName, avatar, weeklyPoints) VALUES (?,?,?,?,?)',
+          [prevWeekStart, w.userId, w.displayName, w.avatar, w.weeklyPoints]
+        );
+        console.log(`[WeeklyReset] Winner saved: ${w.displayName} (${w.weeklyPoints} pts) for week ${prevWeekStart}`);
+      } else {
+        console.log(`[WeeklyReset] No scores found for week ${prevWeekStart}, skipping winner save.`);
+      }
+    } else {
+      console.log(`[WeeklyReset] Winner for ${prevWeekStart} already saved.`);
+    }
+
+    // 4 haftadan eski weeklyScores kayıtlarını sil
+    const cutoffDate = new Date();
+    cutoffDate.setDate(cutoffDate.getDate() - 28);
+    const cutoff = cutoffDate.toISOString().slice(0, 10);
+    const deleteResult = await dbQuery('DELETE FROM weeklyScores WHERE weekStart < ?', [cutoff]);
+    const deletedCount = deleteResult.affectedRows || 0;
+    if (deletedCount > 0) {
+      console.log(`[WeeklyReset] Deleted ${deletedCount} old weekly score records (before ${cutoff})`);
+    }
+
+    console.log(`[WeeklyReset] Reset complete.`);
+  } catch (err) {
+    console.error('[WeeklyReset] Error:', err.message);
+  }
+}
+
+// Pazartesi 00:00'da sıfırlama — her saat kontrol et
+function scheduleWeeklyReset() {
+  const checkAndReset = () => {
+    const now = new Date();
+    // Pazartesi (1) ve saat 00:00-00:59 arasındaysa çalıştır
+    if (now.getDay() === 1 && now.getHours() === 0) {
+      performWeeklyReset();
+    }
+  };
+
+  // Başlangıçta da çalıştır (sunucu yeniden başlatıldığında geçmişi temizle)
+  setTimeout(() => performWeeklyReset(), 5000);
+
+  // Her saat kontrol et
+  setInterval(checkAndReset, 60 * 60 * 1000);
+  console.log('[WeeklyReset] Scheduler started — checks every hour, resets on Monday 00:00');
 }
 
 // ─── tRPC Response Helpers ────────────────────────────────────────────────────
@@ -316,6 +408,14 @@ async function handleRequest(req, res) {
       await dbQuery('DELETE FROM friends WHERE userId=? AND friendUserId=?', [Number(friendUserId), user.id]);
       result = { success: true };
     }
+    else if (procedure === 'leaderboard.getWeeklyWinners') {
+      // Son 8 haftanın kazananlarını getir
+      await ensureWeeklyWinnersTable();
+      const winners = await dbQuery(
+        'SELECT * FROM weeklyWinners ORDER BY weekStart DESC LIMIT 8'
+      );
+      result = winners;
+    }
     else {
       res.writeHead(404);
       res.end(trpcError(`Unknown procedure: ${procedure}`));
@@ -345,6 +445,10 @@ server.listen(PORT, () => {
   console.log(`[AstroGame API] Server running on port ${PORT}`);
   console.log(`[AstroGame API] Database: ${DATABASE_URL ? 'configured ✓' : 'NOT SET ✗'}`);
   getPool()
-    .then(() => console.log('[DB] Connection pool ready ✓'))
+    .then(() => {
+      console.log('[DB] Connection pool ready ✓');
+      // Haftalık sıfırlama zamanlayıcısını başlat
+      scheduleWeeklyReset();
+    })
     .catch(e => console.error('[DB] Connection failed:', e.message));
 });
