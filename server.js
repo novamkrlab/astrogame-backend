@@ -555,6 +555,23 @@ async function handleRequest(req, res) {
       );
       result = rows;
     }
+    else if (procedure === 'debug.fixFriends') {
+      // Eksik ters yönleri düzelten tek seferlik endpoint
+      const allRows = await dbQuery('SELECT userId, friendUserId FROM friends');
+      let fixed = 0;
+      for (const row of allRows) {
+        const reverse = await dbQuery(
+          'SELECT id FROM friends WHERE userId=? AND friendUserId=? LIMIT 1',
+          [row.friendUserId, row.userId]
+        );
+        if (reverse.length === 0) {
+          await dbQuery('INSERT INTO friends (userId, friendUserId) VALUES (?,?)', [row.friendUserId, row.userId]);
+          fixed++;
+          console.log(`[FixFriends] Added reverse: ${row.friendUserId} -> ${row.userId}`);
+        }
+      }
+      result = { fixed, total: allRows.length, message: `${fixed} eksik ters yön eklendi` };
+    }
     else {
       res.writeHead(404);
       res.end(trpcError(`Unknown procedure: ${procedure}`));
