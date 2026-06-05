@@ -493,11 +493,18 @@ async function handleRequest(req, res) {
       if (codeRows.length === 0) throw new Error('Geçersiz arkadaş kodu. Lütfen tekrar kontrol edin.');
       const friendUserId = codeRows[0].userId;
       if (friendUserId === user.id) throw new Error('Kendi kodunu ekleyemezsin!');
-      const existing = await dbQuery('SELECT id FROM friends WHERE userId=? AND friendUserId=? LIMIT 1', [user.id, friendUserId]);
-      if (existing.length > 0) throw new Error('Bu kişi zaten arkadaş listenizde.');
+      // Her iki yönde de kontrol et
+      const existingA = await dbQuery('SELECT id FROM friends WHERE userId=? AND friendUserId=? LIMIT 1', [user.id, friendUserId]);
+      const existingB = await dbQuery('SELECT id FROM friends WHERE userId=? AND friendUserId=? LIMIT 1', [friendUserId, user.id]);
+      if (existingA.length > 0 || existingB.length > 0) throw new Error('Bu kişi zaten arkadaş listenizde.');
+      // Çift yönlü ekle (her iki cihazda da görünsün)
       await dbQuery('INSERT INTO friends (userId, friendUserId) VALUES (?,?)', [user.id, friendUserId]);
-      await dbQuery('INSERT INTO friends (userId, friendUserId) VALUES (?,?) ON DUPLICATE KEY UPDATE id=id', [friendUserId, user.id]);
-      const nameRows = await dbQuery('SELECT displayName FROM leaderboard WHERE userId=? LIMIT 1', [friendUserId]);
+      await dbQuery('INSERT INTO friends (userId, friendUserId) VALUES (?,?)', [friendUserId, user.id]);
+      // Arkadaşın adını önce leaderboard'dan, yoksa users tablosundan al
+      const nameRows = await dbQuery(
+        'SELECT COALESCE(l.displayName, u.name, \'Kaşif\') as displayName FROM users u LEFT JOIN leaderboard l ON l.userId = u.id WHERE u.id=? LIMIT 1',
+        [friendUserId]
+      );
       const friendName = nameRows[0]?.displayName ?? 'Kaşif';
       result = { success: true, friendName };
     }
@@ -510,7 +517,21 @@ async function handleRequest(req, res) {
       else {
         const ids = friendRows.map(r => r.friendUserId);
         const placeholders = ids.map(() => '?').join(',');
-        const entries = await dbQuery(`SELECT l.userId, l.displayName, l.avatar, l.totalScore, l.level, l.sciencePoints FROM leaderboard l WHERE l.userId IN (${placeholders}) ORDER BY l.totalScore DESC`, ids);
+        // leaderboard kaydı olmayan arkadaşları da göster (users tablosundan fallback)
+        const entries = await dbQuery(
+          `SELECT
+            u.id as userId,
+            COALESCE(l.displayName, u.name, 'Kaşif') as displayName,
+            COALESCE(l.avatar, '🧑‍🔬') as avatar,
+            COALESCE(l.totalScore, 0) as totalScore,
+            COALESCE(l.level, 1) as level,
+            COALESCE(l.sciencePoints, 0) as sciencePoints
+          FROM users u
+          LEFT JOIN leaderboard l ON l.userId = u.id
+          WHERE u.id IN (${placeholders})
+          ORDER BY totalScore DESC`,
+          ids
+        );
         result = entries;
       }
     }
