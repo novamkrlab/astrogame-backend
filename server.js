@@ -543,6 +543,18 @@ async function handleRequest(req, res) {
       await dbQuery('DELETE FROM friends WHERE userId=? AND friendUserId=?', [Number(friendUserId), user.id]);
       result = { success: true };
     }
+    else if (procedure === 'debug.friends') {
+      // Geçici debug endpoint - sorun giderme sonrası kaldır
+      const rows = await dbQuery(
+        `SELECT f.id, f.userId, f.friendUserId,
+          u1.name as userName, u2.name as friendName
+         FROM friends f
+         LEFT JOIN users u1 ON u1.id = f.userId
+         LEFT JOIN users u2 ON u2.id = f.friendUserId
+         ORDER BY f.id DESC LIMIT 50`
+      );
+      result = rows;
+    }
     else {
       res.writeHead(404);
       res.end(trpcError(`Unknown procedure: ${procedure}`));
