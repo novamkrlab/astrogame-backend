@@ -54,6 +54,17 @@ function generateFriendCode() {
   return code;
 }
 
+function getCurrentDay() {
+  const now = new Date();
+  return now.toISOString().slice(0, 10); // YYYY-MM-DD
+}
+
+function getPreviousDay() {
+  const now = new Date();
+  now.setDate(now.getDate() - 1);
+  return now.toISOString().slice(0, 10);
+}
+
 function getCurrentWeekStart() {
   const now = new Date();
   const day = now.getDay();
@@ -142,6 +153,73 @@ async function upsertWeeklyScore(data) {
       [data.userId, weekStart, data.displayName, data.avatar, data.weeklyPoints, data.gamesPlayed, data.level]
     );
   }
+}
+
+async function upsertDailyScore(data) {
+  const today = getCurrentDay();
+  const rows = await dbQuery('SELECT id, dailyPoints FROM dailyScores WHERE userId=? AND scoreDate=? LIMIT 1', [data.userId, today]);
+  if (rows.length > 0) {
+    // Sadece daha yüksek skoru kaydet
+    if (data.dailyPoints > rows[0].dailyPoints) {
+      await dbQuery(
+        'UPDATE dailyScores SET displayName=?, avatar=?, dailyPoints=?, gamesPlayed=?, level=? WHERE userId=? AND scoreDate=?',
+        [data.displayName, data.avatar, data.dailyPoints, data.gamesPlayed, data.level, data.userId, today]
+      );
+    }
+  } else {
+    await dbQuery(
+      'INSERT INTO dailyScores (userId, scoreDate, displayName, avatar, dailyPoints, gamesPlayed, level) VALUES (?,?,?,?,?,?,?)',
+      [data.userId, today, data.displayName, data.avatar, data.dailyPoints, data.gamesPlayed, data.level]
+    );
+  }
+}
+
+async function getDailyLeaderboard(limit) {
+  const today = getCurrentDay();
+  const safeLimit = Math.max(1, Math.min(parseInt(limit, 10) || 100, 500));
+  return await dbQuery(`SELECT * FROM dailyScores WHERE scoreDate=? ORDER BY dailyPoints DESC LIMIT ${safeLimit}`, [today]);
+}
+
+async function getMyDailyRank(userId) {
+  const today = getCurrentDay();
+  const myRows = await dbQuery('SELECT dailyPoints FROM dailyScores WHERE userId=? AND scoreDate=? LIMIT 1', [userId, today]);
+  if (!myRows[0]) return null;
+  const myPoints = myRows[0].dailyPoints;
+  const rows = await dbQuery('SELECT COUNT(*) as cnt FROM dailyScores WHERE scoreDate=? AND dailyPoints > ?', [today, myPoints]);
+  return Number(rows[0]?.cnt || 0) + 1;
+}
+
+async function ensureDailyScoresTable() {
+  await dbQuery(`
+    CREATE TABLE IF NOT EXISTS dailyScores (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      userId INT NOT NULL,
+      scoreDate VARCHAR(10) NOT NULL,
+      displayName VARCHAR(100) NOT NULL,
+      avatar VARCHAR(10) DEFAULT '🧑‍🔬',
+      dailyPoints INT DEFAULT 0,
+      gamesPlayed INT DEFAULT 0,
+      level INT DEFAULT 1,
+      createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE KEY unique_user_day (userId, scoreDate),
+      KEY idx_date (scoreDate)
+    )
+  `);
+}
+
+async function ensureDailyWinnersTable() {
+  await dbQuery(`
+    CREATE TABLE IF NOT EXISTS dailyWinners (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      scoreDate VARCHAR(10) NOT NULL,
+      userId INT NOT NULL,
+      displayName VARCHAR(100) NOT NULL,
+      avatar VARCHAR(10) DEFAULT '🧑‍🔬',
+      dailyPoints INT DEFAULT 0,
+      createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE KEY unique_day (scoreDate)
+    )
+  `);
 }
 
 async function getWeeklyLeaderboard(limit) {
@@ -243,6 +321,64 @@ async function sendExpoPushNotifications(tokens, title, body, data = {}) {
       req.end();
     });
   }
+}
+
+// ─── Günlük Sıfırlama ────────────────────────────────────────────────────────
+
+async function performDailyReset() {
+  const yesterday = getPreviousDay();
+  console.log(`[DailyReset] Checking — yesterday: ${yesterday}`);
+  try {
+    await ensureDailyWinnersTable();
+    await ensureDailyScoresTable();
+
+    // Dünün kazananını kaydet (henüz kaydedilmediyse)
+    const alreadySaved = await dbQuery('SELECT id FROM dailyWinners WHERE scoreDate=? LIMIT 1', [yesterday]);
+    if (alreadySaved.length === 0) {
+      const winners = await dbQuery(
+        'SELECT userId, displayName, avatar, dailyPoints FROM dailyScores WHERE scoreDate=? ORDER BY dailyPoints DESC LIMIT 1',
+        [yesterday]
+      );
+      if (winners.length > 0) {
+        const w = winners[0];
+        await dbQuery(
+          'INSERT INTO dailyWinners (scoreDate, userId, displayName, avatar, dailyPoints) VALUES (?,?,?,?,?)',
+          [yesterday, w.userId, w.displayName, w.avatar, w.dailyPoints]
+        );
+        console.log(`[DailyReset] Winner saved: ${w.displayName} (${w.dailyPoints} pts) for ${yesterday}`);
+      }
+    }
+
+    // 7 günden eski dailyScores kayıtlarını sil
+    const cutoff = new Date();
+    cutoff.setDate(cutoff.getDate() - 7);
+    const cutoffStr = cutoff.toISOString().slice(0, 10);
+    const del = await dbQuery('DELETE FROM dailyScores WHERE scoreDate < ?', [cutoffStr]);
+    if ((del.affectedRows || 0) > 0) {
+      console.log(`[DailyReset] Deleted ${del.affectedRows} old daily score records`);
+    }
+
+    console.log('[DailyReset] Complete.');
+  } catch (err) {
+    console.error('[DailyReset] Error:', err.message);
+  }
+}
+
+function scheduleDailyReset() {
+  const checkAndReset = () => {
+    const now = new Date();
+    // Her gün 00:00-00:59 arasında çalıştır
+    if (now.getHours() === 0) {
+      performDailyReset();
+    }
+  };
+
+  // Başlangıçta da çalıştır
+  setTimeout(() => performDailyReset(), 6000);
+
+  // Her saat kontrol et
+  setInterval(checkAndReset, 60 * 60 * 1000);
+  console.log('[DailyReset] Scheduler started — checks every hour, resets at 00:00');
 }
 
 // ─── Haftalık Sıfırlama ───────────────────────────────────────────────────────
@@ -458,6 +594,44 @@ async function handleRequest(req, res) {
       });
       result = { success: true };
     }
+    else if (procedure === 'leaderboard.getDailyTop') {
+      await ensureDailyScoresTable();
+      const limit = Math.min(Number(input.limit) || 100, 200);
+      result = await getDailyLeaderboard(limit);
+    }
+    else if (procedure === 'leaderboard.getMyDailyRank') {
+      const { deviceId } = input;
+      if (!deviceId) throw new Error('deviceId required');
+      const user = await getUserByOpenId(`device:${deviceId}`);
+      if (!user) {
+        result = { rank: null };
+      } else {
+        const rank = await getMyDailyRank(user.id);
+        result = { rank };
+      }
+    }
+    else if (procedure === 'leaderboard.updateDailyScore') {
+      const { deviceId, displayName, avatar, dailyPoints, gamesPlayed, level } = input;
+      if (!deviceId || !displayName) throw new Error('deviceId and displayName required');
+      await ensureDailyScoresTable();
+      const user = await upsertDeviceUser(deviceId, displayName);
+      await upsertDailyScore({
+        userId: user.id,
+        displayName,
+        avatar: avatar || '🧑‍🔬',
+        dailyPoints: Number(dailyPoints) || 0,
+        gamesPlayed: Number(gamesPlayed) || 0,
+        level: Number(level) || 1,
+      });
+      result = { success: true };
+    }
+    else if (procedure === 'leaderboard.getDailyWinners') {
+      await ensureDailyWinnersTable();
+      const winners = await dbQuery(
+        'SELECT * FROM dailyWinners ORDER BY scoreDate DESC LIMIT 14'
+      );
+      result = winners;
+    }
     else if (procedure === 'leaderboard.getWeeklyWinners') {
       await ensureWeeklyWinnersTable();
       const winners = await dbQuery(
@@ -574,7 +748,8 @@ server.listen(PORT, () => {
   getPool()
     .then(() => {
       console.log('[DB] Connection pool ready ✓');
-      // Haftalık sıfırlama zamanlayıcısını başlat
+      // Günlük ve haftalık sıfırlama zamanlayıcılarını başlat
+      scheduleDailyReset();
       scheduleWeeklyReset();
     })
     .catch(e => console.error('[DB] Connection failed:', e.message));
