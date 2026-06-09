@@ -543,35 +543,6 @@ async function handleRequest(req, res) {
       await dbQuery('DELETE FROM friends WHERE userId=? AND friendUserId=?', [Number(friendUserId), user.id]);
       result = { success: true };
     }
-    else if (procedure === 'debug.friends') {
-      // Geçici debug endpoint - sorun giderme sonrası kaldır
-      const rows = await dbQuery(
-        `SELECT f.id, f.userId, f.friendUserId,
-          u1.name as userName, u2.name as friendName
-         FROM friends f
-         LEFT JOIN users u1 ON u1.id = f.userId
-         LEFT JOIN users u2 ON u2.id = f.friendUserId
-         ORDER BY f.id DESC LIMIT 50`
-      );
-      result = rows;
-    }
-    else if (procedure === 'debug.fixFriends') {
-      // Eksik ters yönleri düzelten tek seferlik endpoint
-      const allRows = await dbQuery('SELECT userId, friendUserId FROM friends');
-      let fixed = 0;
-      for (const row of allRows) {
-        const reverse = await dbQuery(
-          'SELECT id FROM friends WHERE userId=? AND friendUserId=? LIMIT 1',
-          [row.friendUserId, row.userId]
-        );
-        if (reverse.length === 0) {
-          await dbQuery('INSERT INTO friends (userId, friendUserId) VALUES (?,?)', [row.friendUserId, row.userId]);
-          fixed++;
-          console.log(`[FixFriends] Added reverse: ${row.friendUserId} -> ${row.userId}`);
-        }
-      }
-      result = { fixed, total: allRows.length, message: `${fixed} eksik ters yön eklendi` };
-    }
     else {
       res.writeHead(404);
       res.end(trpcError(`Unknown procedure: ${procedure}`));
