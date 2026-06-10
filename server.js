@@ -207,6 +207,20 @@ async function ensureDailyScoresTable() {
   `);
 }
 
+async function ensureAnnouncementsTable() {
+  await dbQuery(`
+    CREATE TABLE IF NOT EXISTS announcements (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      title VARCHAR(200) NOT NULL,
+      body TEXT NOT NULL,
+      type ENUM('update','announcement','winner','system') DEFAULT 'announcement',
+      appVersion VARCHAR(20) DEFAULT NULL,
+      createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      KEY idx_created (createdAt)
+    )
+  `);
+}
+
 async function ensureDailyWinnersTable() {
   await dbQuery(`
     CREATE TABLE IF NOT EXISTS dailyWinners (
@@ -716,6 +730,29 @@ async function handleRequest(req, res) {
       await dbQuery('DELETE FROM friends WHERE userId=? AND friendUserId=?', [user.id, Number(friendUserId)]);
       await dbQuery('DELETE FROM friends WHERE userId=? AND friendUserId=?', [Number(friendUserId), user.id]);
       result = { success: true };
+    }
+    // ─── Bildirimler ───────────────────────────────────────────────────────────
+    else if (procedure === 'notifications.getAnnouncements') {
+      await ensureAnnouncementsTable();
+      const { limit = 30 } = input;
+      const safeLimit = Math.max(1, Math.min(parseInt(limit, 10) || 30, 100));
+      const rows = await dbQuery(`SELECT * FROM announcements ORDER BY createdAt DESC LIMIT ${safeLimit}`, []);
+      result = rows;
+    }
+    else if (procedure === 'notifications.sendUpdateNotification') {
+      // Admin endpoint: güncelleme bildirimi gönder ve duyuru oluştur
+      const { adminKey, title, body, appVersion, type = 'update' } = input;
+      if (adminKey !== (process.env.ADMIN_KEY || 'astrogame-admin-2024')) throw new Error('Unauthorized');
+      await ensureAnnouncementsTable();
+      // Duyuruyu kaydet
+      await dbQuery(
+        'INSERT INTO announcements (title, body, type, appVersion) VALUES (?,?,?,?)',
+        [title, body, type, appVersion || null]
+      );
+      // Tüm kullanıcılara push gönder
+      const tokens = await getAllPushTokens();
+      await sendExpoPushNotifications(tokens, title, body, { type, appVersion });
+      result = { success: true, sentTo: tokens.length };
     }
     else {
       res.writeHead(404);
