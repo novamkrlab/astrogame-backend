@@ -395,6 +395,36 @@ function scheduleDailyReset() {
   console.log('[DailyReset] Scheduler started — checks every hour, resets at 00:00');
 }
 
+// ─── Soru İstatistikleri ─────────────────────────────────────────────────────
+
+async function ensureQuestionStatsTable() {
+  await dbQuery(`
+    CREATE TABLE IF NOT EXISTS questionStats (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      questionId VARCHAR(200) NOT NULL,
+      questionText VARCHAR(500) NOT NULL,
+      wrongCount INT DEFAULT 0,
+      totalCount INT DEFAULT 0,
+      updatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      UNIQUE KEY unique_question (questionId(150))
+    )
+  `);
+}
+
+async function logWrongQuestions(wrongQuestions) {
+  if (!wrongQuestions || !Array.isArray(wrongQuestions) || wrongQuestions.length === 0) return;
+  await ensureQuestionStatsTable();
+  for (const q of wrongQuestions) {
+    if (!q.questionId || !q.questionText) continue;
+    await dbQuery(
+      `INSERT INTO questionStats (questionId, questionText, wrongCount, totalCount)
+       VALUES (?, ?, 1, 1)
+       ON DUPLICATE KEY UPDATE wrongCount = wrongCount + 1, totalCount = totalCount + 1, questionText = VALUES(questionText)`,
+      [String(q.questionId).slice(0, 200), String(q.questionText).slice(0, 500)]
+    );
+  }
+}
+
 // ─── Haftalık Sıfırlama ───────────────────────────────────────────────────────
 
 async function ensureWeeklyWinnersTable() {
@@ -578,7 +608,7 @@ async function handleRequest(req, res) {
       }
     }
     else if (procedure === 'leaderboard.updateScore') {
-      const { deviceId, displayName, avatar, totalScore, gamesPlayed, gamesWon, level, sciencePoints, bestWinStreak } = input;
+      const { deviceId, displayName, avatar, totalScore, gamesPlayed, gamesWon, level, sciencePoints, bestWinStreak, wrongQuestions } = input;
       if (!deviceId || !displayName) throw new Error('deviceId and displayName required');
       const user = await upsertDeviceUser(deviceId, displayName);
       await upsertLeaderboardEntry({
@@ -592,6 +622,10 @@ async function handleRequest(req, res) {
         sciencePoints: Number(sciencePoints) || 0,
         bestWinStreak: Number(bestWinStreak) || 0,
       });
+      // Yanlış cevaplanan soruları logla (varsa)
+      if (wrongQuestions && Array.isArray(wrongQuestions)) {
+        await logWrongQuestions(wrongQuestions).catch(e => console.error('[QuestionStats] Log error:', e.message));
+      }
       result = { success: true, userId: user.id };
     }
     else if (procedure === 'leaderboard.updateWeeklyScore') {
@@ -791,6 +825,16 @@ async function handleRequest(req, res) {
       );
       // Toplam oyun sayısı
       const [totalGamesRow] = await dbQuery('SELECT SUM(gamesPlayed) as total FROM leaderboard');
+      // En çok yanlış yapılan sorular
+      let hardestQuestions = [];
+      try {
+        await ensureQuestionStatsTable();
+        hardestQuestions = await dbQuery(
+          'SELECT questionId, questionText, wrongCount, totalCount FROM questionStats ORDER BY wrongCount DESC LIMIT 10'
+        );
+      } catch (e) {
+        console.error('[admin.getStats] questionStats error:', e.message);
+      }
 
       result = {
         totalUsers: totalUsersRow?.count || 0,
@@ -801,6 +845,7 @@ async function handleRequest(req, res) {
         topWeekly: topWeeklyRow || null,
         weeklyTrend: trendRows || [],
         topPlayers: topPlayersRows || [],
+        hardestQuestions: hardestQuestions || [],
       };
     }
     else {
