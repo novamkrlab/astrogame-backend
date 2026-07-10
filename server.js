@@ -754,6 +754,55 @@ async function handleRequest(req, res) {
       await sendExpoPushNotifications(tokens, title, body, { type, appVersion });
       result = { success: true, sentTo: tokens.length };
     }
+    else if (procedure === 'admin.getStats') {
+      const { adminKey } = input;
+      if (adminKey !== (process.env.ADMIN_KEY || 'astrogame-admin-2024')) throw new Error('Unauthorized');
+
+      const today = new Date().toISOString().slice(0, 10);
+
+      // Toplam kullanıcı
+      const [totalUsersRow] = await dbQuery('SELECT COUNT(*) as count FROM leaderboard');
+      // Bugün oynayan kullanıcı
+      const [dailyActiveRow] = await dbQuery(
+        'SELECT COUNT(DISTINCT userId) as count FROM dailyScores WHERE scoreDate = ?', [today]
+      );
+      // Tüm zamanların en yüksek skoru
+      const [topScoreRow] = await dbQuery(
+        'SELECT displayName, avatar, totalScore, gamesPlayed FROM leaderboard ORDER BY totalScore DESC LIMIT 1'
+      );
+      // Bu haftanın en yüksek skoru
+      const weekStart = getCurrentWeekStart();
+      const [topWeeklyRow] = await dbQuery(
+        'SELECT displayName, avatar, weeklyPoints FROM weeklyScores WHERE weekStart=? ORDER BY weeklyPoints DESC LIMIT 1', [weekStart]
+      );
+      // Push token kayıtlı kullanıcı sayısı
+      const [pushTokensRow] = await dbQuery('SELECT COUNT(*) as count FROM pushTokens');
+      // Son 7 günün aktif kullanıcı trendi
+      const trendRows = await dbQuery(
+        `SELECT scoreDate as day, COUNT(DISTINCT userId) as users
+         FROM dailyScores
+         WHERE scoreDate >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)
+         GROUP BY scoreDate
+         ORDER BY scoreDate ASC`
+      );
+      // En çok oynayan top 5
+      const topPlayersRows = await dbQuery(
+        'SELECT displayName, avatar, gamesPlayed, totalScore, level FROM leaderboard ORDER BY gamesPlayed DESC LIMIT 5'
+      );
+      // Toplam oyun sayısı
+      const [totalGamesRow] = await dbQuery('SELECT SUM(gamesPlayed) as total FROM leaderboard');
+
+      result = {
+        totalUsers: totalUsersRow?.count || 0,
+        dailyActive: dailyActiveRow?.count || 0,
+        pushTokenCount: pushTokensRow?.count || 0,
+        totalGames: totalGamesRow?.total || 0,
+        topScore: topScoreRow || null,
+        topWeekly: topWeeklyRow || null,
+        weeklyTrend: trendRows || [],
+        topPlayers: topPlayersRows || [],
+      };
+    }
     else {
       res.writeHead(404);
       res.end(trpcError(`Unknown procedure: ${procedure}`));
